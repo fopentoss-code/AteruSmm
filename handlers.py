@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command, StateFilter
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -129,8 +129,8 @@ async def finish_round_and_select_winner(bot: Bot, round_data: dict):
     await db.delete_current_round()
     await db.clear_participants()
 
-async def create_invite_for_participant(message: Message, user_id: int, channel: dict, bot: Bot, round_data: dict):
-    link_name = f"@{message.from_user.username}" if message.from_user.username else str(user_id)
+async def create_invite_for_participant(msg: Message, user_id: int, channel: dict, bot: Bot, round_data: dict):
+    link_name = f"@{msg.from_user.username}" if msg.from_user.username else str(user_id)
     expire_date = datetime.now() + timedelta(hours=INVITE_LINK_EXPIRE_HOURS, minutes=INVITE_LINK_EXTRA_MINUTES)
     try:
         invite_link = await bot.create_chat_invite_link(
@@ -140,10 +140,10 @@ async def create_invite_for_participant(message: Message, user_id: int, channel:
             member_limit=0
         )
     except Exception as e:
-        await message.answer(f"Не удалось создать пригласительную ссылку: {e}")
+        await msg.answer(f"Не удалось создать пригласительную ссылку: {e}")
         return
     await db.add_participant(user_id, invite_link.invite_link, link_name)
-    await message.answer(
+    await msg.answer(
         f"✅ Вы откликнулись на пиар!\n"
         f"Ваша уникальная ссылка для приглашения:\n{invite_link.invite_link}\n\n"
         f"🔁 Приглашайте друзей по этой ссылке. Каждый новый подписчик, пришедший по вашей ссылке, принесёт вам 1 поинт.\n"
@@ -444,17 +444,23 @@ async def admin_get_channel(message: Message, state: FSMContext, bot: Bot):
     )
     await state.set_state(CreateRoundStates.waiting_for_confirmation)
 
-@router.callback_query(F.data == "admin_confirm_round", StateFilter(None))
+@router.callback_query(F.data == "admin_confirm_round")
 async def admin_confirm_round(callback: CallbackQuery, state: FSMContext, bot: Bot):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer("Нет доступа", show_alert=True)
         return
+    # Очищаем состояние, чтобы не было конфликта
     await state.clear()
     current = await db.get_current_round()
     if not current:
         await callback.message.answer("Нет созданного раунда.")
         await callback.answer()
         return
+    if current.get('waiting_for_admin') != 1:
+        await callback.message.answer("Раунд уже был запущен или отменён.")
+        await callback.answer()
+        return
+    # Снимаем флаг ожидания админа
     await db.set_round_waiting_for_admin(False)
     channel = await db.get_user_channel(current['channel_id'])
     if channel:
@@ -552,8 +558,8 @@ async def complaint_accept(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     complaint_id = int(callback.data.split("_")[-1])
-    # Здесь нужно получить against_user_id и забанить (упрощённо)
     await db.resolve_complaint(complaint_id, True, "Принято администратором")
+    # Здесь нужно также забанить пользователя, на которого жалоба (упрощённо)
     await callback.message.edit_text("✅ Жалоба принята. Пользователь забанен.")
     await callback.answer()
 
