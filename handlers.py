@@ -1,8 +1,10 @@
 import asyncio
+import random
 from datetime import datetime, timedelta
+
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 
@@ -10,12 +12,10 @@ from config import (
     ADMIN_ID, EXCHANGE_CHANNEL_ID, EXCHANGE_GROUP_ID,
     EXCHANGE_CHANNEL_USERNAME, EXCHANGE_GROUP_USERNAME,
     ROUND_DURATION_MINUTES, CONFIRMATION_TIMEOUT_MINUTES,
-    MIN_POINTS_TO_WIN, INVITE_LINK_EXPIRE_HOURS, INVITE_LINK_EXTRA_MINUTES,
-    CHECK_SUBSCRIBE_INTERVAL_SECONDS
+    MIN_POINTS_TO_WIN, INVITE_LINK_EXPIRE_HOURS, INVITE_LINK_EXTRA_MINUTES
 )
 import database as db
 import keyboards as kb
-from scheduler import schedule_round_end, schedule_winner_confirmation, cancel_scheduled_tasks
 
 router = Router()
 
@@ -30,14 +30,12 @@ class ComplaintStates(StatesGroup):
 
 class WinnerSetupStates(StatesGroup):
     waiting_for_channel_link = State()
-    waiting_for_bot_admin_check = State()
 
 class JoinRoundStates(StatesGroup):
-    waiting_for_subscription_check = State()  # после нажатия "откликнуться", проверяем подписку на канал заказчика
+    waiting_for_subscription_check = State()
 
 # ---------------------- Вспомогательные функции ----------------------
 async def check_exchange_subscriptions(user_id: int, bot: Bot) -> bool:
-    """Проверяет, подписан ли пользователь на канал и группу биржи"""
     try:
         channel_member = await bot.get_chat_member(EXCHANGE_CHANNEL_ID, user_id)
         group_member = await bot.get_chat_member(EXCHANGE_GROUP_ID, user_id)
@@ -50,7 +48,6 @@ async def check_exchange_subscriptions(user_id: int, bot: Bot) -> bool:
         return False
 
 async def check_user_subscribed_to_channel(user_id: int, channel_id: int, bot: Bot) -> bool:
-    """Проверяет, подписан ли пользователь на указанный канал (используется для исполнителей)"""
     try:
         member = await bot.get_chat_member(channel_id, user_id)
         return member.status in ['member', 'administrator', 'creator']
@@ -58,7 +55,6 @@ async def check_user_subscribed_to_channel(user_id: int, channel_id: int, bot: B
         return False
 
 async def update_participant_invite_counts(round_data: dict, bot: Bot):
-    """Обновляет количество приглашённых для каждого участника, используя member_count из invite_link"""
     participants = await db.get_participants()
     for p in participants:
         try:
@@ -77,42 +73,14 @@ async def update_participant_invite_counts(round_data: dict, bot: Bot):
                 await db.update_participant_points(p['user_id'], new_count)
                 await db.update_user_balance(p['user_id'], delta)
         elif new_count < old_count:
-            # Ссылка могла быть пересоздана? Не должно быть, но на всякий случай синхронизируем
             await db.update_participant_points(p['user_id'], new_count)
-            # Баланс не уменьшаем, так как это был бы ошибочный учёт
-    # После обновления перечитываем участников
     return await db.get_participants()
 
-async def select_next_winner_from_leaderboard(bot: Bot, current_round: dict, exclude_user_id: int = None):
-    """
-    Выбирает следующего победителя из тир-листа (исключая указанного)
-    Возвращает winner_user_id, winner_points, или (None, None) если нет подходящих
-    """
-    # Получаем всех пользователей с поинтами >= MIN_POINTS_TO_WIN, отсортированных по убыванию
-    all_users = await db.get_all_users()
-    eligible = [u for u in all_users if u['total_points'] >= MIN_POINTS_TO_WIN]
-    if exclude_user_id:
-        eligible = [u for u in eligible if u['user_id'] != exclude_user_id]
-    if not eligible:
-        return None, None
-    eligible.sort(key=lambda x: x['total_points'], reverse=True)
-    # Если несколько с одинаковыми поинтами, выбираем случайного среди них
-    max_points = eligible[0]['total_points']
-    top = [u for u in eligible if u['total_points'] == max_points]
-    import random
-    winner = random.choice(top)
-    return winner['user_id'], winner['total_points']
-
 async def finish_round_and_select_winner(bot: Bot, round_data: dict):
-    """Завершает раунд, обновляет статистику, отправляет уведомление победителю, запускает таймер подтверждения"""
-    # Обновляем количество приглашённых у всех участников
     participants = await update_participant_invite_counts(round_data, bot)
-    
-    # Отфильтровываем тех, у кого points >= MIN_POINTS_TO_WIN
     eligible = [p for p in participants if p['points'] >= MIN_POINTS_TO_WIN]
     if not eligible:
-        # Нет победителя
-        history_id = await db.add_round_history(
+        await db.add_round_history(
             winner_user_id=0,
             winner_points=0,
             start_time=round_data['start_time'],
@@ -125,14 +93,10 @@ async def finish_round_and_select_winner(bot: Bot, round_data: dict):
         await bot.send_message(EXCHANGE_GROUP_ID,
                                "🏆 Раунд завершён. Никто не набрал минимальное количество поинтов. Следующий раунд будет объявлен позже.")
         return
-    
-    # Сортируем по убыванию поинтов
     eligible.sort(key=lambda x: x['points'], reverse=True)
     winner = eligible[0]
     winner_points = winner['points']
     winner_id = winner['user_id']
-    
-    # Сохраняем историю раунда
     history_id = await db.add_round_history(
         winner_user_id=winner_id,
         winner_points=winner_points,
@@ -141,12 +105,8 @@ async def finish_round_and_select_winner(bot: Bot, round_data: dict):
         status='completed',
         channel_id=round_data['channel_id']
     )
-    
-    # Создаём запись ожидания победителя
     expires_at = datetime.now() + timedelta(minutes=CONFIRMATION_TIMEOUT_MINUTES)
     await db.set_pending_winner(winner_id, history_id, expires_at)
-    
-    # Отправляем уведомление победителю в ЛС
     try:
         await bot.send_message(
             winner_id,
@@ -157,12 +117,8 @@ async def finish_round_and_select_winner(bot: Bot, round_data: dict):
         )
     except Exception as e:
         print(f"Не удалось отправить сообщение победителю {winner_id}: {e}")
-    
-    # Запланируем автоматический отказ по таймауту
     from scheduler import schedule_winner_timeout
     await schedule_winner_timeout(bot, winner_id, history_id)
-    
-    # Оповещаем группу
     winner_user = await db.get_user(winner_id)
     winner_name = winner_user.get('username') if winner_user else str(winner_id)
     await bot.send_message(
@@ -170,19 +126,37 @@ async def finish_round_and_select_winner(bot: Bot, round_data: dict):
         f"🏆 Раунд завершён! Победитель: @{winner_name} с {winner_points} поинтами.\n"
         f"Ему отправлено уведомление для подтверждения пиара своего канала."
     )
-    
-    # Очищаем текущий раунд и участников (они больше не нужны, но сами данные остались в истории)
     await db.delete_current_round()
     await db.clear_participants()
 
-# ---------------------- Команда /start ----------------------
+async def create_invite_for_participant(message: Message, user_id: int, channel: dict, bot: Bot, round_data: dict):
+    link_name = f"@{message.from_user.username}" if message.from_user.username else str(user_id)
+    expire_date = datetime.now() + timedelta(hours=INVITE_LINK_EXPIRE_HOURS, minutes=INVITE_LINK_EXTRA_MINUTES)
+    try:
+        invite_link = await bot.create_chat_invite_link(
+            chat_id=channel['channel_id'],
+            name=link_name,
+            expire_date=expire_date,
+            member_limit=0
+        )
+    except Exception as e:
+        await message.answer(f"Не удалось создать пригласительную ссылку: {e}")
+        return
+    await db.add_participant(user_id, invite_link.invite_link, link_name)
+    await message.answer(
+        f"✅ Вы откликнулись на пиар!\n"
+        f"Ваша уникальная ссылка для приглашения:\n{invite_link.invite_link}\n\n"
+        f"🔁 Приглашайте друзей по этой ссылке. Каждый новый подписчик, пришедший по вашей ссылке, принесёт вам 1 поинт.\n"
+        f"📊 По окончании раунда составляется тир-лист, и победитель получает пиар своего канала.",
+        reply_markup=kb.back_to_main_menu()
+    )
+
+# ---------------------- Команды /start, /help ----------------------
 @router.message(Command("start"))
 async def cmd_start(message: Message, bot: Bot):
     user_id = message.from_user.id
     username = message.from_user.username
     await db.register_user(user_id, username)
-    
-    # Проверяем подписки на канал и группу биржи
     subscribed = await check_exchange_subscriptions(user_id, bot)
     if not subscribed:
         text = (f"📢 Для использования бота необходимо подписаться на наш канал и группу:\n"
@@ -197,13 +171,9 @@ async def cmd_start(message: Message, bot: Bot):
             ])
         )
         return
-    
-    # Проверяем бан
     if await db.is_user_banned(user_id):
         await message.answer("🚫 Вы забанены в системе. Обратитесь к администратору.")
         return
-    
-    # Показываем главное меню
     is_admin = (user_id == ADMIN_ID)
     await message.answer(
         "Добро пожаловать в Ateru SMM Bot!\nВыберите действие:",
@@ -225,11 +195,10 @@ async def cmd_help(message: Message):
     )
     await message.answer(help_text, parse_mode="Markdown")
 
-# ---------------------- Обработчики главного меню (callback) ----------------------
+# ---------------------- Главное меню и основные кнопки ----------------------
 @router.callback_query(F.data == "main_menu")
 async def callback_main_menu(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
-    # Проверяем подписки заново
     subscribed = await check_exchange_subscriptions(user_id, bot)
     if not subscribed:
         await callback.message.edit_text("❗ Вы отписались от канала или группы. Пожалуйста, подпишитесь снова и нажмите /start.")
@@ -267,29 +236,20 @@ async def callback_join_round(callback: CallbackQuery, state: FSMContext, bot: B
         await callback.message.answer("❌ Нет активного пиара.")
         await callback.answer()
         return
-    
-    # Проверяем, не участвует ли уже
     existing = await db.get_participant(user_id)
     if existing:
         await callback.message.answer("✅ Вы уже участвуете в текущем пиаре.")
         await callback.answer()
         return
-    
-    # Проверяем, не забанен ли
     if await db.is_user_banned(user_id):
         await callback.message.answer("🚫 Вы забанены и не можете участвовать.")
         return
-    
-    # Получаем канал заказчика
     channel = await db.get_user_channel(current_round['channel_id'])
     if not channel:
         await callback.message.answer("Ошибка: канал, который пиарится, не найден в БД.")
         return
-    
-    # Проверяем, подписан ли пользователь на канал заказчика (условие участия)
     subscribed = await check_user_subscribed_to_channel(user_id, channel['channel_id'], bot)
     if not subscribed:
-        # Предлагаем подписаться
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔗 Подписаться на канал", url=f"https://t.me/{channel['username']}")],
             [InlineKeyboardButton(text="✅ Я подписался", callback_data="check_subscription_after_join")]
@@ -303,8 +263,6 @@ async def callback_join_round(callback: CallbackQuery, state: FSMContext, bot: B
         await state.set_state(JoinRoundStates.waiting_for_subscription_check)
         await callback.answer()
         return
-    
-    # Уже подписан → создаём пригласительную ссылку
     await create_invite_for_participant(callback.message, user_id, channel, bot, current_round)
     await callback.answer()
 
@@ -317,53 +275,24 @@ async def check_subscription_after_join(callback: CallbackQuery, state: FSMConte
         await callback.message.answer("Ошибка: канал не найден. Попробуйте снова /start.")
         await state.clear()
         return
-    
     current_round = await db.get_current_round()
     if not current_round or current_round['status'] != 'active':
         await callback.message.answer("Раунд уже завершён.")
         await state.clear()
         return
-    
     channel = await db.get_user_channel(current_round['channel_id'])
     if not channel:
         await callback.message.answer("Ошибка канала.")
         await state.clear()
         return
-    
     subscribed = await check_user_subscribed_to_channel(user_id, channel['channel_id'], bot)
     if not subscribed:
         await callback.message.answer("❌ Вы ещё не подписаны. Пожалуйста, подпишитесь и нажмите кнопку снова.")
         await callback.answer()
         return
-    
-    # Подписан → создаём ссылку
     await create_invite_for_participant(callback.message, user_id, channel, bot, current_round)
     await state.clear()
     await callback.answer()
-
-async def create_invite_for_participant(message: Message, user_id: int, channel: dict, bot: Bot, round_data: dict):
-    """Создаёт пригласительную ссылку для исполнителя и добавляет его в участники"""
-    link_name = f"@{message.from_user.username}" if message.from_user.username else str(user_id)
-    expire_date = datetime.now() + timedelta(hours=INVITE_LINK_EXPIRE_HOURS, minutes=INVITE_LINK_EXTRA_MINUTES)
-    try:
-        invite_link = await bot.create_chat_invite_link(
-            chat_id=channel['channel_id'],
-            name=link_name,
-            expire_date=expire_date,
-            member_limit=0  # безлимит
-        )
-    except Exception as e:
-        await message.answer(f"Не удалось создать пригласительную ссылку: {e}")
-        return
-    
-    await db.add_participant(user_id, invite_link.invite_link, link_name)
-    await message.answer(
-        f"✅ Вы откликнулись на пиар!\n"
-        f"Ваша уникальная ссылка для приглашения:\n{invite_link.invite_link}\n\n"
-        f"🔁 Приглашайте друзей по этой ссылке. Каждый новый подписчик, пришедший по вашей ссылке, принесёт вам 1 поинт.\n"
-        f"📊 По окончании раунда составляется тир-лист, и победитель получает пиар своего канала.",
-        reply_markup=kb.back_to_main_menu()
-    )
 
 @router.callback_query(F.data == "my_balance")
 async def callback_my_balance(callback: CallbackQuery):
@@ -447,7 +376,6 @@ async def complaint_get_reason(message: Message, state: FSMContext):
     await db.add_complaint(from_id, against_id, round_id, reason)
     await message.answer("✅ Жалоба отправлена администратору. Будет рассмотрена.")
     await state.clear()
-    # Возвращаем в главное меню
     await cmd_start(message, message.bot)
 
 # ---------------------- Админ-панель ----------------------
@@ -466,7 +394,6 @@ async def callback_admin_panel(callback: CallbackQuery):
     await callback.message.edit_text("🛠 Админ-панель", reply_markup=kb.admin_panel_menu())
     await callback.answer()
 
-# ---- Создание нового раунда ----
 @router.callback_query(F.data == "admin_create_round")
 async def admin_create_round(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
@@ -498,7 +425,6 @@ async def admin_get_channel(message: Message, state: FSMContext, bot: Bot):
     except Exception as e:
         await message.answer(f"Не удалось найти канал: {e}\nПроверьте ссылку и убедитесь, что бот добавлен в канал.")
         return
-    # Проверяем, что бот админ в канале
     try:
         bot_member = await bot.get_chat_member(channel_id, bot.id)
         if bot_member.status not in ['administrator', 'creator']:
@@ -507,7 +433,6 @@ async def admin_get_channel(message: Message, state: FSMContext, bot: Bot):
     except Exception as e:
         await message.answer(f"Ошибка проверки прав: {e}")
         return
-    # Сохраняем канал в БД (владелец = ADMIN_ID, так как создаёт админ)
     await db.add_channel(ADMIN_ID, channel_id, username, title, True)
     start_time = datetime.now()
     end_time = start_time + timedelta(minutes=ROUND_DURATION_MINUTES)
@@ -519,38 +444,38 @@ async def admin_get_channel(message: Message, state: FSMContext, bot: Bot):
     )
     await state.set_state(CreateRoundStates.waiting_for_confirmation)
 
-@router.callback_query(F.data == "admin_confirm_round")
+@router.callback_query(F.data == "admin_confirm_round", StateFilter(None))
 async def admin_confirm_round(callback: CallbackQuery, state: FSMContext, bot: Bot):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer()
+        await callback.answer("Нет доступа", show_alert=True)
         return
+    await state.clear()
     current = await db.get_current_round()
     if not current:
         await callback.message.answer("Нет созданного раунда.")
         await callback.answer()
         return
-    # Снимаем флаг ожидания админа
     await db.set_round_waiting_for_admin(False)
-    # Публикуем в группе
     channel = await db.get_user_channel(current['channel_id'])
     if channel:
-        await bot.send_message(
-            EXCHANGE_GROUP_ID,
-            f"🎉 *Старт пиара!*\n"
-            f"Канал: {channel.get('username') or channel.get('title')}\n"
-            f"Продолжительность: {ROUND_DURATION_MINUTES} минут.\n"
-            f"Нажмите «Откликнуться» в боте, чтобы участвовать и зарабатывать поинты.\n"
-            f"Победитель получит пиар своего канала!",
-            parse_mode="Markdown"
-        )
-    # Запланировать окончание раунда
+        try:
+            await bot.send_message(
+                EXCHANGE_GROUP_ID,
+                f"🎉 *Старт пиара!*\n"
+                f"Канал: {channel.get('username') or channel.get('title')}\n"
+                f"Продолжительность: {ROUND_DURATION_MINUTES} минут.\n"
+                f"Нажмите «Откликнуться» в боте, чтобы участвовать и зарабатывать поинты.\n"
+                f"Победитель получит пиар своего канала!",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            print(f"Не удалось отправить сообщение в группу: {e}")
     from scheduler import schedule_round_end
     await schedule_round_end(bot, current['end_time'])
     await callback.message.edit_text(
         f"✅ Раунд запущен! Участники могут откликаться.\nОкончание: {current['end_time']}"
     )
     await callback.answer()
-    await state.clear()
 
 @router.callback_query(F.data == "admin_cancel_round")
 async def admin_cancel_round(callback: CallbackQuery, state: FSMContext):
@@ -570,12 +495,10 @@ async def admin_stop_round(callback: CallbackQuery, bot: Bot):
     if not current:
         await callback.message.answer("Нет активного раунда.")
         return
-    # Принудительно завершаем
     await finish_round_and_select_winner(bot, current)
     await callback.message.edit_text("✅ Раунд принудительно завершён.")
     await callback.answer()
 
-# ---- Прочие админ-функции (списки, жалобы, история) ----
 @router.callback_query(F.data == "admin_users_list")
 async def admin_users_list(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -629,10 +552,8 @@ async def complaint_accept(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     complaint_id = int(callback.data.split("_")[-1])
+    # Здесь нужно получить against_user_id и забанить (упрощённо)
     await db.resolve_complaint(complaint_id, True, "Принято администратором")
-    # Здесь нужно получить against_user_id и забанить
-    # Для простоты вызовем ban_user, но в реальном коде нужно извлечь against_user_id из жалобы
-    # Пропустим для краткости, но в полной версии это необходимо
     await callback.message.edit_text("✅ Жалоба принята. Пользователь забанен.")
     await callback.answer()
 
@@ -672,10 +593,8 @@ async def winner_accept(callback: CallbackQuery, state: FSMContext, bot: Bot):
         await callback.message.answer("❌ Нет активного запроса на подтверждение.")
         await callback.answer()
         return
-    # Отменяем запланированный таймаут
     from scheduler import cancel_winner_timeout
     await cancel_winner_timeout(user_id)
-    # Запрашиваем ссылку на канал победителя
     await callback.message.answer("Отлично! Теперь отправьте ссылку на ваш Telegram канал или группу (например, @username).")
     await state.update_data(history_id=pending['round_history_id'])
     await state.set_state(WinnerSetupStates.waiting_for_channel_link)
@@ -689,21 +608,11 @@ async def winner_decline(callback: CallbackQuery, bot: Bot):
         await callback.message.answer("❌ Нет активного запроса.")
         await callback.answer()
         return
-    # Обнуляем поинты победителя
     await db.reset_user_points(user_id)
     await db.clear_pending_winner()
     from scheduler import cancel_winner_timeout
     await cancel_winner_timeout(user_id)
-    # Оповещаем группу
     await bot.send_message(EXCHANGE_GROUP_ID, f"⚠️ Победитель @{callback.from_user.username or user_id} отказался от пиара. Поинты списаны.")
-    # Пытаемся выбрать следующего победителя из тир-листа
-    current_round = await db.get_current_round()
-    if current_round and current_round['status'] == 'active':
-        # Если раунд ещё активен, просто сообщаем
-        pass
-    else:
-        # Раунда нет, возможно, нужно создать новый? Но логика проще: уведомить админа
-        await bot.send_message(ADMIN_ID, f"Победитель отказался, а активного раунда нет. Запустите новый раунд вручную.")
     await callback.message.edit_text("Вы отказались. Ваши поинты списаны. Вы можете участвовать в следующих раундах заново.")
     await callback.answer()
 
@@ -724,7 +633,6 @@ async def winner_set_channel(message: Message, state: FSMContext, bot: Bot):
     except Exception as e:
         await message.answer(f"Не удалось найти канал: {e}")
         return
-    # Проверяем, добавил ли пользователь бота в админы
     try:
         bot_member = await bot.get_chat_member(channel_id, bot.id)
         if bot_member.status not in ['administrator', 'creator']:
@@ -733,16 +641,9 @@ async def winner_set_channel(message: Message, state: FSMContext, bot: Bot):
     except Exception as e:
         await message.answer(f"Ошибка проверки прав: {e}")
         return
-    # Сохраняем канал в БД
     await db.add_channel(user_id, channel_id, username, title, True)
-    # Обнуляем поинты победителя
     await db.reset_user_points(user_id)
-    # Удаляем ожидание победителя
     await db.clear_pending_winner()
-    # Сохраняем в историю, что этот канал будет следующим (можно записать в специальную таблицу, но пока просто уведомим админа)
-    data = await state.get_data()
-    history_id = data.get('history_id')
-    # Уведомляем админа о необходимости запустить раунд с этим каналом
     await bot.send_message(
         ADMIN_ID,
         f"🏆 Победитель @{message.from_user.username or user_id} подтвердил участие и предоставил канал {username}.\n"
@@ -762,6 +663,4 @@ async def winner_timeout(bot: Bot, user_id: int, history_id: int):
         await db.clear_pending_winner()
         await bot.send_message(user_id, "⏰ Время на ответ истекло. Ваши поинты списаны. Вы можете участвовать в следующих раундах.")
         await bot.send_message(EXCHANGE_GROUP_ID, f"⏰ Победитель @{user_id} не ответил вовремя. Поинты списаны.")
-        # Выбор следующего победителя из тир-листа (если есть)
-        # Здесь нужно реализовать логику, но для краткости оставим уведомление админу
         await bot.send_message(ADMIN_ID, f"Победитель {user_id} не ответил. Можно запустить новый раунд вручную.")
