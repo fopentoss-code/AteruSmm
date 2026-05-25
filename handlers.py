@@ -52,6 +52,7 @@ async def check_user_subscribed_to_channel(user_id: int, channel_id: int, bot: B
         return False
 
 async def update_participant_invite_counts(round_data: dict, bot: Bot):
+    """Обновляет количество приглашённых для каждого участника и начисляет поинты в user_points"""
     participants = await db.get_participants()
     for p in participants:
         try:
@@ -135,28 +136,6 @@ async def get_username(user_id: int) -> str:
     user = await db.get_user(user_id)
     return user.get('username') if user and user.get('username') else str(user_id)
 
-async def create_invite_for_participant(msg: Message, user_id: int, channel: dict, bot: Bot, round_data: dict):
-    link_name = f"@{msg.from_user.username}" if msg.from_user.username else str(user_id)
-    expire_date = datetime.now() + timedelta(hours=INVITE_LINK_EXPIRE_HOURS, minutes=INVITE_LINK_EXTRA_MINUTES)
-    try:
-        invite_link = await bot.create_chat_invite_link(
-            chat_id=channel['channel_id'],
-            name=link_name,
-            expire_date=expire_date,
-            member_limit=0
-        )
-    except Exception as e:
-        await msg.answer(f"Не удалось создать пригласительную ссылку: {e}")
-        return
-    await db.add_participant(user_id, invite_link.invite_link, link_name)
-    await msg.answer(
-        f"✅ Вы откликнулись на пиар!\n"
-        f"Ваша уникальная ссылка для приглашения (активна {INVITE_LINK_EXPIRE_HOURS}ч {INVITE_LINK_EXTRA_MINUTES}мин):\n{invite_link.invite_link}\n\n"
-        f"🔁 Приглашайте друзей по этой ссылке. Каждый новый подписчик принесёт вам 1 поинт.\n"
-        f"📊 По окончании раунда вы получите итоги.",
-        reply_markup=kb.back_to_main_menu()
-    )
-
 # ---------------------- Команды /start, /help ----------------------
 @router.message(Command("start"))
 async def cmd_start(message: Message, bot: Bot):
@@ -212,16 +191,23 @@ async def callback_main_menu(callback: CallbackQuery, bot: Bot):
     await callback.message.edit_text("Главное меню:", reply_markup=kb.main_menu(user_id, is_admin))
     await callback.answer()
 
+# Исправленный обработчик кнопки "Мой баланс"
 @router.callback_query(F.data == "my_balance")
-async def callback_my_balance(callback: CallbackQuery):
+async def callback_my_balance(callback: CallbackQuery, bot: Bot):
     user_id = callback.from_user.id
     points = await db.get_user_points(user_id)
-    await callback.message.answer(
-        f"💰 Ваш текущий баланс поинтов: {points}\n\n"
-        f"Поинты начисляются за каждого приведённого по вашей ссылке подписчика.",
-        reply_markup=kb.back_to_main_menu()
-    )
-    await callback.answer()
+    # Если callback пришёл из канала (групповой чат), не отвечаем в канале, а пишем в ЛС
+    if callback.message.chat.type in ['channel', 'group', 'supergroup']:
+        # Отправляем личное сообщение пользователю
+        try:
+            await bot.send_message(user_id, f"💰 Ваш текущий баланс поинтов: {points}\n\nПоинты начисляются за каждого приведённого по вашей ссылке подписчика.", reply_markup=kb.back_to_main_menu())
+            await callback.answer("💰 Баланс отправлен в личные сообщения.", show_alert=True)
+        except Exception as e:
+            await callback.answer("Не удалось отправить сообщение в ЛС. Убедитесь, что вы не заблокировали бота.", show_alert=True)
+    else:
+        # Личный чат
+        await callback.message.answer(f"💰 Ваш текущий баланс поинтов: {points}\n\nПоинты начисляются за каждого приведённого по вашей ссылке подписчика.", reply_markup=kb.back_to_main_menu())
+        await callback.answer()
 
 @router.callback_query(F.data == "leaderboard")
 async def callback_leaderboard(callback: CallbackQuery):
@@ -541,7 +527,6 @@ async def join_round_callback(callback: CallbackQuery, bot: Bot):
 
     subscribed = await check_user_subscribed_to_channel(user_id, channel['channel_id'], bot)
     if not subscribed:
-        # Не пишем в канал, только уведомление через всплывающее окно
         await callback.answer(f"❌ Вы не подписаны на канал @{channel['username']}. Подпишитесь и нажмите кнопку заново.", show_alert=True)
         return
 
