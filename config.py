@@ -1,7 +1,7 @@
 import os
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", 0))  # Ваш Telegram ID
+ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
 
 EXCHANGE_CHANNEL_ID = int(os.getenv("EXCHANGE_CHANNEL_ID", -1001234567890))
 EXCHANGE_GROUP_ID = int(os.getenv("EXCHANGE_GROUP_ID", -1009876543210))
@@ -10,8 +10,8 @@ EXCHANGE_GROUP_USERNAME = os.getenv("EXCHANGE_GROUP_USERNAME", "ateruchat")
 
 ROUND_DURATION_MINUTES = int(os.getenv("ROUND_DURATION_MINUTES", 60))
 CONFIRMATION_TIMEOUT_MINUTES = int(os.getenv("CONFIRMATION_TIMEOUT_MINUTES", 10))
-MIN_POINTS_TO_WIN = int(os.getenv("MIN_POINTS_TO_WIN", 5))          # минимум 5 поинтов для участия в тир-листе
+MIN_POINTS_TO_WIN = int(os.getenv("MIN_POINTS_TO_WIN", 1))          # изменено с 5 на 1
 INVITE_LINK_EXPIRE_HOURS = int(os.getenv("INVITE_LINK_EXPIRE_HOURS", 1))
-INVITE_LINK_EXTRA_MINUTES = int(os.getenv("INVITE_LINK_EXTRA_MINUTES", 10))  # итого 1 час 10 мин
+INVITE_LINK_EXTRA_MINUTES = int(os.getenv("INVITE_LINK_EXTRA_MINUTES", 10))
 
 CHECK_SUBSCRIBE_INTERVAL_SECONDS = int(os.getenv("CHECK_SUBSCRIBE_INTERVAL_SECONDS", 30))
