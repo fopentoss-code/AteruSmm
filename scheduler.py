@@ -99,11 +99,37 @@ async def _check_all_subscriptions(bot: Bot):
             await db.set_subscription_status(user_id, 'channel', False)
             await db.set_subscription_status(user_id, 'group', False)
 
+# ---------------------- Новая периодическая задача: обновление поинтов текущего раунда ----------------------
+async def schedule_points_update(bot: Bot):
+    """Запускает периодическое обновление поинтов участников активного раунда (каждые 60 секунд)"""
+    job_id = "points_update"
+    if job_id in _scheduled_jobs:
+        return
+    trigger = IntervalTrigger(seconds=60)  # каждую минуту
+    job = scheduler.add_job(
+        _update_current_round_points,
+        trigger=trigger,
+        args=[bot],
+        id=job_id,
+        replace_existing=True
+    )
+    _scheduled_jobs[job_id] = job
+
+async def _update_current_round_points(bot: Bot):
+    """Обновляет поинты участников текущего активного раунда через get_chat_invite_link"""
+    current_round = await db.get_current_round()
+    if not current_round or current_round['status'] != 'active':
+        return
+    # Импортируем функцию из handlers
+    from handlers import update_participant_invite_counts
+    await update_participant_invite_counts(current_round, bot)
+
 # ---------------------- Запуск и остановка планировщика ----------------------
 async def start_scheduler(bot: Bot):
     """Запускает планировщик и все периодические задачи"""
     scheduler.start()
     await schedule_periodic_subscription_check(bot)
+    await schedule_points_update(bot)  # Добавлено для обновления поинтов в реальном времени
     
     # При старте проверяем, есть ли активный раунд — перепланируем его завершение
     current_round = await db.get_current_round()
