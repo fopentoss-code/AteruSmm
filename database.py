@@ -52,7 +52,7 @@ def init_db():
         end_time TIMESTAMP,
         status TEXT DEFAULT 'active',
         waiting_for_admin INTEGER DEFAULT 0,
-        start_message_id INTEGER DEFAULT 0    -- ID сообщения в канале о старте пиара
+        start_message_id INTEGER DEFAULT 0
     )''')
     
     # Участники текущего раунда (исполнители)
@@ -277,6 +277,15 @@ async def get_participant(user_id: int) -> Optional[Dict]:
     conn.close()
     return dict(row) if row else None
 
+async def get_participant_by_invite_link(invite_link: str) -> Optional[Dict]:
+    """Находит участника текущего раунда по полной ссылке (invite_link)"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    row = c.execute("SELECT * FROM round_participants WHERE invite_link = ?", (invite_link,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
 async def update_participant_points(user_id: int, points: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -370,7 +379,7 @@ async def get_user_complaints_today(user_id: int) -> int:
     conn.close()
     return count
 
-# ----- Коины (для магазина) -----
+# ----- Коины -----
 async def add_coins(user_id: int, amount: int):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
@@ -389,17 +398,13 @@ async def get_user_coins(user_id: int) -> int:
     return row[0] if row else 0
 
 async def convert_points_to_coins(user_id: int, points: int) -> bool:
-    """Списывает поинты и начисляет коины 1:1. Возвращает True при успехе."""
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Проверяем, что у пользователя достаточно поинтов
     c.execute("SELECT total_points FROM user_points WHERE user_id = ? AND total_points >= ?", (user_id, points))
     if not c.fetchone():
         conn.close()
         return False
-    # Списываем поинты
     c.execute("UPDATE user_points SET total_points = total_points - ?, last_updated = CURRENT_TIMESTAMP WHERE user_id = ?", (points, user_id))
-    # Начисляем коины
     c.execute("UPDATE user_coins SET total_coins = total_coins + ?, last_updated = CURRENT_TIMESTAMP WHERE user_id = ?", (points, user_id))
     if c.rowcount == 0:
         c.execute("INSERT INTO user_coins (user_id, total_coins) VALUES (?, ?)", (user_id, points))
